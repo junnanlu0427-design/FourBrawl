@@ -58,32 +58,42 @@ namespace Brawl.View
                 if (!tag.Success || !url.Success) { State = St.UpToDate; yield break; }
                 Remote = int.Parse(tag.Groups[1].Value);
                 if (Remote <= BUILD) { State = St.UpToDate; yield break; }
-                zipPath = Path.Combine(Application.temporaryCachePath, "FourBrawl-v" + Remote + ".zip");
+                zipPath = Path.Combine(Application.temporaryCachePath, "FourBrawl-v" + Remote + "-" + Process.GetCurrentProcess().Id + ".zip");
                 State = St.Downloading;
                 dl = new UnityWebRequest(url.Groups[1].Value, "GET", new DownloadHandlerFile(zipPath) { removeFileOnAbort = true }, null);
                 dl.SetRequestHeader("User-Agent", "FourBrawl-Updater");
                 yield return dl.SendWebRequest();
                 bool ok = dl.result == UnityWebRequest.Result.Success; Error = dl.error; dl.Dispose(); dl = null;
                 State = ok && File.Exists(zipPath) && new FileInfo(zipPath).Length > 1000000 ? St.Ready : St.Failed;
+                zipReady = State == St.Ready;
             }
         }
+
+        bool zipReady, launched;
+        /// <summary>直接关掉游戏（没点更新、点了稍后、倒计时里关窗口）也要把已下载的新版装上，下次打开就是新版。</summary>
+        void OnApplicationQuit() { if (zipReady && !launched) Launch(false); }
 
         /// <summary>退出游戏，由 PowerShell 脚本等游戏关掉后解压覆盖并重新打开。</summary>
         public void ApplyAndRestart()
         {
-            if (State != St.Ready) return;
+            if (State != St.Ready && !zipReady) return;
+            if (Launch(true)) Application.Quit();
+        }
+
+        bool Launch(bool restart)
+        {
             try
             {
                 string exe = Process.GetCurrentProcess().MainModule.FileName;
-                string dir = Path.GetDirectoryName(exe), script = Path.Combine(Application.temporaryCachePath, "fb_update.ps1");
+                string dir = Path.GetDirectoryName(exe), script = Path.Combine(Application.temporaryCachePath, "fb_update_" + Process.GetCurrentProcess().Id + ".ps1");
                 const string ps =
-                    "param($ProcId, $Zip, $Dest, $Exe)\r\n" +
+                    "param($ProcId, $Zip, $Dest, $Exe, $Restart = 1)\r\n" +
                     "$log = Join-Path ([IO.Path]::GetDirectoryName($Zip)) 'fb_update.log'\r\n" +
                     "function L($m) { Add-Content -LiteralPath $log -Value ((Get-Date -Format 'HH:mm:ss') + ' ' + $m) -Encoding UTF8 }\r\n" +
                     "L ('start dest=' + $Dest + ' exe=' + $Exe)\r\n" +
                     "for ($i = 0; $i -lt 200 -and (Get-Process -Id $ProcId -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 300 }\r\n" +
                     "Start-Sleep -Milliseconds 800\r\n" +
-                    "$tmp = Join-Path ([IO.Path]::GetDirectoryName($Zip)) 'fb_new'\r\n" +
+                    "$tmp = Join-Path ([IO.Path]::GetDirectoryName($Zip)) ('fb_new_' + $ProcId)\r\n" +
                     "try {\r\n" +
                     "  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }\r\n" +
                     "  Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force -ErrorAction Stop\r\n" +
@@ -96,18 +106,20 @@ namespace Brawl.View
                     "  robocopy $src $Dest /E /IS /IT /R:20 /W:1 /NFL /NDL /NJH /NJS | Out-Null; $rc = $LASTEXITCODE; L ('robocopy exit ' + $rc)\r\n" +
                     "  if ($rc -ge 8) { Copy-Item -Path (Join-Path $src '*') -Destination $Dest -Recurse -Force -ErrorAction Continue; L 'fallback Copy-Item done' }\r\n" +
                     "  if ($found.Name -ne $name) { Copy-Item -LiteralPath (Join-Path $Dest $found.Name) -Destination $Exe -Force -ErrorAction SilentlyContinue; Copy-Item -LiteralPath (Join-Path $src ($found.BaseName + '_Data')) -Destination (Join-Path $Dest ([IO.Path]::GetFileNameWithoutExtension($name) + '_Data')) -Recurse -Force -ErrorAction SilentlyContinue; L 'renamed exe/data' }\r\n" +
-                    "  Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue\r\n" +
+                    "  $dll = 'FourBrawl_Data\\Managed\\Assembly-CSharp.dll'; $a = Join-Path $src $dll; $b = Join-Path $Dest ([IO.Path]::GetFileNameWithoutExtension($name) + '_Data\\Managed\\Assembly-CSharp.dll')\r\n" +
+                    "  if ((Test-Path -LiteralPath $a) -and (Test-Path -LiteralPath $b) -and ((Get-FileHash -LiteralPath $a).Hash -ne (Get-FileHash -LiteralPath $b).Hash)) { L 'verify mismatch, retry copy'; Start-Sleep 2; Copy-Item -Path (Join-Path $src '*') -Destination $Dest -Recurse -Force -ErrorAction Continue }\r\n" +
+                    "  if ((Test-Path -LiteralPath $b) -and (Get-FileHash -LiteralPath $a).Hash -eq (Get-FileHash -LiteralPath $b).Hash) { L 'verify ok' } else { L 'verify FAILED' }\r\n" +
+                    "  Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue\r\n" +
                     "} catch { L ('error ' + $_) }\r\n" +
-                    "Start-Process -FilePath $Exe -WorkingDirectory $Dest\r\n" +
-                    "L 'restarted'\r\n";
+                    "if ($Restart -eq 1) { Start-Process -FilePath $Exe -WorkingDirectory $Dest; L 'restarted' } else { L 'applied on quit (no restart)' }\r\n";
                 File.WriteAllText(script, ps, new UTF8Encoding(true));
                 var psi = new ProcessStartInfo("powershell.exe",
-                    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Q(script) + " -ProcId " + Process.GetCurrentProcess().Id + " -Zip " + Q(zipPath) + " -Dest " + Q(dir) + " -Exe " + Q(exe))
+                    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Q(script) + " -ProcId " + Process.GetCurrentProcess().Id + " -Zip " + Q(zipPath) + " -Dest " + Q(dir) + " -Exe " + Q(exe) + " -Restart " + (restart ? 1 : 0))
                 { UseShellExecute = false, CreateNoWindow = true };
-                Process.Start(psi);
-                Application.Quit();
+                Process.Start(psi); launched = true;
+                return true;
             }
-            catch (Exception e) { State = St.Failed; Error = e.Message; UnityEngine.Debug.LogException(e); }
+            catch (Exception e) { State = St.Failed; Error = e.Message; UnityEngine.Debug.LogException(e); return false; }
         }
         static string Q(string s) => "\"" + s.Replace("\"", "") + "\"";
     }
